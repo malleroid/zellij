@@ -92,6 +92,77 @@ use zellij_utils::{
     ipc::{ClientAttributes, PixelDimensions},
 };
 
+/// Parses a namespaced OSC 99 response and extracts the original pane ID
+/// and un-namespaced response bytes.
+///
+/// Input bytes (the termwiz OperatingSystemCommand payload after stripping "99;"):
+/// e.g. b"i=p42.mynotif" or b"i=p42.mynotif:p=close;some_data"
+///
+/// Returns Some((terminal_id, full_osc_bytes)) where full_osc_bytes is
+/// the complete reconstructed OSC 99 sequence with original identifier,
+/// ready to write to the pane's PTY.
+/// Denormalizes a namespaced OSC 99 response.
+///
+/// Parses the namespaced `i=p<N>[r][q].<original_id>` format and returns:
+/// - `pane_id`: the terminal pane that originated the notification
+/// - `app_wants_report`: `r` flag — app originally requested `a=report`
+/// - `is_query`: `q` flag — this was a capability query (`p=?`)
+/// - `restored_response_bytes`: the response with the original `i=` value restored
+pub(crate) fn denormalize_notification_response(
+    payload: &[u8],
+) -> Option<(u32, bool, bool, Vec<u8>)> {
+    let payload_str = str::from_utf8(payload).ok()?;
+
+    // Split into metadata and response payload on first ';'
+    let (metadata, response_payload) = match payload_str.find(';') {
+        Some(idx) => (
+            payload_str.get(..idx).unwrap_or_default(),
+            payload_str.get(idx..).unwrap_or_default(),
+        ),
+        None => (payload_str, ""),
+    };
+
+    // Find the i= key in colon-separated metadata
+    let mut terminal_id = None;
+    let mut app_wants_report = false;
+    let mut is_query = false;
+    let mut restored_parts = Vec::new();
+
+    for kv in metadata.split(':') {
+        if let Some(namespaced_value) = kv.strip_prefix("i=p") {
+            // Parse "p<N>[r][q].<original_id>"
+            if let Some(dot_pos) = namespaced_value.find('.') {
+                let flags_part = namespaced_value.get(..dot_pos).unwrap_or_default();
+                let original_id = namespaced_value.get(dot_pos + 1..).unwrap_or_default();
+                let pane_id_str = flags_part.trim_end_matches(|c| c == 'r' || c == 'q');
+                let flag_chars = flags_part.get(pane_id_str.len()..).unwrap_or_default();
+                if let Ok(pid) = pane_id_str.parse::<u32>() {
+                    terminal_id = Some(pid);
+                    app_wants_report = flag_chars.contains('r');
+                    is_query = flag_chars.contains('q');
+                    // Empty original_id means the app never sent an i= key;
+                    // don't inject one into the response
+                    if !original_id.is_empty() {
+                        restored_parts.push(format!("i={}", original_id));
+                    }
+                    continue;
+                }
+            }
+        }
+        restored_parts.push(kv.to_string());
+    }
+
+    let terminal_id = terminal_id?;
+    let restored_metadata = restored_parts.join(":");
+    let full_response = format!("\x1b]99;{}{}\x1b\\", restored_metadata, response_payload);
+    Some((
+        terminal_id,
+        app_wants_report,
+        is_query,
+        full_response.into_bytes(),
+    ))
+}
+
 /// Get the active tab and call a closure on it
 ///
 /// If no active tab can be found, an error is logged instead.
@@ -476,6 +547,7 @@ pub enum ScreenInstruction {
         Option<PathBuf>,
         ClientId,
         Option<NotificationEnd>,
+        Option<usize>, // tab_id
     ), // Option<String> is
     // optional pane title, bool is skip cache, Option<PathBuf> is an optional cwd
     NewFloatingPluginPane(
@@ -486,6 +558,7 @@ pub enum ScreenInstruction {
         Option<FloatingPaneCoordinates>,
         ClientId,
         Option<NotificationEnd>,
+        Option<usize>, // tab_id
     ), // Option<String> is an
     // optional pane title, bool
     // is skip cache, Option<PathBuf> is an optional cwd
@@ -497,6 +570,7 @@ pub enum ScreenInstruction {
         bool,
         ClientId,
         Option<NotificationEnd>,
+        Option<usize>, // tab_id
     ), // Option<String> is an
     // optional pane title, first bool is skip cache, second bool is close_replaced_pane
     StartOrReloadPluginPane(RunPluginOrAlias, Option<String>, Option<NotificationEnd>),
@@ -530,6 +604,7 @@ pub enum ScreenInstruction {
         bool,
         ClientId,
         Option<NotificationEnd>,
+        Option<usize>, // tab_id
     ), // bools are: should_float, move_to_focused_tab, should_open_in_place, close_replaced_pane, Option<PaneId> is the pane id to replace, bool following it is skip_cache
     LaunchPlugin(
         RunPluginOrAlias,
@@ -541,6 +616,7 @@ pub enum ScreenInstruction {
         Option<PathBuf>,
         ClientId,
         Option<NotificationEnd>,
+        Option<usize>, // tab_id
     ), // bools are: should_float, should_open_in_place, close_replaced_pane, Option<PaneId> is the pane id to replace, Option<PathBuf> is an optional cwd, bool after is skip_cache
     SuppressPane(PaneId, ClientId),
     UnsuppressPane(PaneId, bool), // bool -> should float if hidden
@@ -706,6 +782,7 @@ pub enum ScreenInstruction {
     NotifyPaneClosedToSubscribers {
         pane_id: zellij_utils::data::PaneId,
     },
+    DesktopNotificationResponse(Vec<u8>, ClientId),
     PluginSubscribedToAnsiPaneContents(bool), // true = at least one plugin needs ANSI content
     UpdateBackgroundPluginSubscriptions(PluginId, ClientId, HashSet<EventType>),
     BroadcastModeUpdate(ModeInfo, Option<ClientId>), // ModeInfo, optional specific client_id (None = all clients)
@@ -1007,6 +1084,9 @@ impl From<&ScreenInstruction> for ScreenContext {
             },
             ScreenInstruction::ClearPluginHighlights { .. } => ScreenContext::ClearPluginHighlights,
             ScreenInstruction::ClearAllPluginHighlights(..) => ScreenContext::ClearPluginHighlights,
+            ScreenInstruction::DesktopNotificationResponse(..) => {
+                ScreenContext::DesktopNotificationResponse
+            },
             ScreenInstruction::SubscribeToPaneRenders { .. } => {
                 ScreenContext::SubscribeToPaneRenders
             },
@@ -5061,6 +5141,29 @@ pub(crate) fn screen_thread_main(
                         }
                     },
                     ClientTabIndexOrPaneId::TabIndex(tab_index) => {
+                        // Some placements (directional split, stacked without a
+                        // target pane) need a client_id to know which pane to
+                        // split relative to. Only resolve one when required.
+                        let needs_client_id = matches!(
+                            new_pane_placement,
+                            NewPanePlacement::Tiled {
+                                direction: Some(_),
+                                ..
+                            } | NewPanePlacement::Stacked {
+                                pane_id_to_stack_under: None,
+                                ..
+                            }
+                        );
+                        let client_id = if needs_client_id {
+                            screen
+                                .active_tab_ids
+                                .iter()
+                                .find(|(_, tid)| **tid == tab_index)
+                                .map(|(cid, _)| *cid)
+                                .or_else(|| screen.active_tab_ids.keys().next().copied())
+                        } else {
+                            None
+                        };
                         if let Some(active_tab) = screen.tabs.get_mut(&tab_index) {
                             active_tab.new_pane(
                                 pid,
@@ -5069,7 +5172,7 @@ pub(crate) fn screen_thread_main(
                                 start_suppressed,
                                 true,
                                 new_pane_placement,
-                                None,
+                                client_id,
                                 blocking_notification,
                             )?;
                             if let Some(hold_for_command) = hold_for_command {
@@ -6953,8 +7056,10 @@ pub(crate) fn screen_thread_main(
                 cwd,
                 client_id,
                 completion_tx,
+                explicit_tab_id,
             ) => {
-                let tab_index = screen.active_tab_ids.values().next().unwrap_or(&1);
+                let tab_index = explicit_tab_id
+                    .unwrap_or_else(|| *screen.active_tab_ids.values().next().unwrap_or(&1));
                 let size = Size::default();
                 let should_float = Some(false);
                 let should_be_opened_in_place = false;
@@ -6967,7 +7072,7 @@ pub(crate) fn screen_thread_main(
                         false, // close_replaced_pane
                         pane_title,
                         run_plugin,
-                        *tab_index,
+                        tab_index,
                         None,
                         client_id,
                         size,
@@ -6986,36 +7091,41 @@ pub(crate) fn screen_thread_main(
                 floating_pane_coordinates,
                 client_id,
                 completion_tx,
-            ) => match screen.active_tab_ids.values().next() {
-                Some(tab_index) => {
-                    let size = Size::default();
-                    let should_float = Some(true);
-                    let should_be_opened_in_place = false;
-                    screen
-                        .bus
-                        .senders
-                        .send_to_pty(PtyInstruction::FillPluginCwd(
-                            should_float,
-                            should_be_opened_in_place,
-                            false, // close_replaced_pane
-                            pane_title,
-                            run_plugin,
-                            *tab_index,
-                            None,
-                            client_id,
-                            size,
-                            skip_cache,
-                            cwd,
-                            None,
-                            floating_pane_coordinates,
-                            completion_tx,
-                        ))?;
-                },
-                None => {
-                    log::error!(
-                        "Could not find an active tab - is there at least 1 connected user?"
-                    );
-                },
+                explicit_tab_id,
+            ) => {
+                let resolved_tab_index =
+                    explicit_tab_id.or_else(|| screen.active_tab_ids.values().next().copied());
+                match resolved_tab_index {
+                    Some(tab_index) => {
+                        let size = Size::default();
+                        let should_float = Some(true);
+                        let should_be_opened_in_place = false;
+                        screen
+                            .bus
+                            .senders
+                            .send_to_pty(PtyInstruction::FillPluginCwd(
+                                should_float,
+                                should_be_opened_in_place,
+                                false, // close_replaced_pane
+                                pane_title,
+                                run_plugin,
+                                tab_index,
+                                None,
+                                client_id,
+                                size,
+                                skip_cache,
+                                cwd,
+                                None,
+                                floating_pane_coordinates,
+                                completion_tx,
+                            ))?;
+                    },
+                    None => {
+                        log::error!(
+                            "Could not find an active tab - is there at least 1 connected user?"
+                        );
+                    },
+                }
             },
             ScreenInstruction::NewInPlacePluginPane(
                 run_plugin,
@@ -7025,36 +7135,41 @@ pub(crate) fn screen_thread_main(
                 close_replaced_pane,
                 client_id,
                 completion_tx,
-            ) => match screen.active_tab_ids.values().next() {
-                Some(tab_index) => {
-                    let size = Size::default();
-                    let should_float = None;
-                    let should_be_in_place = true;
-                    screen
-                        .bus
-                        .senders
-                        .send_to_pty(PtyInstruction::FillPluginCwd(
-                            should_float,
-                            should_be_in_place,
-                            close_replaced_pane,
-                            pane_title,
-                            run_plugin,
-                            *tab_index,
-                            Some(pane_id_to_replace),
-                            client_id,
-                            size,
-                            skip_cache,
-                            None,
-                            None,
-                            None,
-                            completion_tx,
-                        ))?;
-                },
-                None => {
-                    log::error!(
-                        "Could not find an active tab - is there at least 1 connected user?"
-                    );
-                },
+                explicit_tab_id,
+            ) => {
+                let resolved_tab_index =
+                    explicit_tab_id.or_else(|| screen.active_tab_ids.values().next().copied());
+                match resolved_tab_index {
+                    Some(tab_index) => {
+                        let size = Size::default();
+                        let should_float = None;
+                        let should_be_in_place = true;
+                        screen
+                            .bus
+                            .senders
+                            .send_to_pty(PtyInstruction::FillPluginCwd(
+                                should_float,
+                                should_be_in_place,
+                                close_replaced_pane,
+                                pane_title,
+                                run_plugin,
+                                tab_index,
+                                Some(pane_id_to_replace),
+                                client_id,
+                                size,
+                                skip_cache,
+                                None,
+                                None,
+                                None,
+                                completion_tx,
+                            ))?;
+                    },
+                    None => {
+                        log::error!(
+                            "Could not find an active tab - is there at least 1 connected user?"
+                        );
+                    },
+                }
             },
             ScreenInstruction::StartOrReloadPluginPane(run_plugin, pane_title, completion_tx) => {
                 let tab_index = screen.active_tab_ids.values().next().unwrap_or(&1);
@@ -7251,9 +7366,12 @@ pub(crate) fn screen_thread_main(
                 skip_cache,
                 client_id,
                 mut completion_tx,
+                explicit_tab_id,
             ) => match pane_id_to_replace {
                 Some(pane_id_to_replace) if should_open_in_place => {
-                    match screen.active_tab_ids.values().next() {
+                    let resolved_tab_index =
+                        explicit_tab_id.or_else(|| screen.active_tab_ids.values().next().copied());
+                    match resolved_tab_index {
                         Some(tab_index) => {
                             let size = Size::default();
                             screen
@@ -7265,7 +7383,7 @@ pub(crate) fn screen_thread_main(
                                     close_replaced_pane,
                                     None,
                                     run_plugin,
-                                    *tab_index,
+                                    tab_index,
                                     Some(pane_id_to_replace),
                                     client_id,
                                     size,
@@ -7295,7 +7413,10 @@ pub(crate) fn screen_thread_main(
                             .get(&client_id)
                             .map(|tab_index| (*tab_index, client_id))
                     });
-                    match client_id_and_focused_tab {
+                    let resolved_tab_and_client = explicit_tab_id
+                        .and_then(|tid| client_id.map(|cid| (tid, cid)))
+                        .or(client_id_and_focused_tab);
+                    match resolved_tab_and_client {
                         Some((tab_index, client_id)) => {
                             if screen.focus_plugin_pane(
                                 &run_plugin,
@@ -7345,35 +7466,40 @@ pub(crate) fn screen_thread_main(
                 cwd,
                 client_id,
                 completion_tx,
+                explicit_tab_id,
             ) => match pane_id_to_replace {
-                Some(pane_id_to_replace) => match screen.active_tab_ids.values().next() {
-                    Some(tab_index) => {
-                        let size = Size::default();
-                        screen
-                            .bus
-                            .senders
-                            .send_to_pty(PtyInstruction::FillPluginCwd(
-                                Some(should_float),
-                                should_open_in_place,
-                                close_replaced_pane,
-                                None,
-                                run_plugin,
-                                *tab_index,
-                                Some(pane_id_to_replace),
-                                client_id,
-                                size,
-                                skip_cache,
-                                cwd,
-                                None,
-                                None,
-                                completion_tx,
-                            ))?;
-                    },
-                    None => {
-                        log::error!(
-                            "Could not find an active tab - is there at least 1 connected user?"
-                        );
-                    },
+                Some(pane_id_to_replace) => {
+                    let resolved_tab_index =
+                        explicit_tab_id.or_else(|| screen.active_tab_ids.values().next().copied());
+                    match resolved_tab_index {
+                        Some(tab_index) => {
+                            let size = Size::default();
+                            screen
+                                .bus
+                                .senders
+                                .send_to_pty(PtyInstruction::FillPluginCwd(
+                                    Some(should_float),
+                                    should_open_in_place,
+                                    close_replaced_pane,
+                                    None,
+                                    run_plugin,
+                                    tab_index,
+                                    Some(pane_id_to_replace),
+                                    client_id,
+                                    size,
+                                    skip_cache,
+                                    cwd,
+                                    None,
+                                    None,
+                                    completion_tx,
+                                ))?;
+                        },
+                        None => {
+                            log::error!(
+                                "Could not find an active tab - is there at least 1 connected user?"
+                            );
+                        },
+                    }
                 },
                 None => {
                     let client_id = if screen.active_tab_ids.contains_key(&client_id) {
@@ -7387,7 +7513,10 @@ pub(crate) fn screen_thread_main(
                             .get(&client_id)
                             .map(|tab_index| (*tab_index, client_id))
                     });
-                    match client_id_and_focused_tab {
+                    let resolved_tab_and_client = explicit_tab_id
+                        .and_then(|tid| client_id.map(|cid| (tid, cid)))
+                        .or(client_id_and_focused_tab);
+                    match resolved_tab_and_client {
                         Some((tab_index, client_id)) => {
                             screen
                                 .bus
@@ -8462,6 +8591,40 @@ pub(crate) fn screen_thread_main(
                     tab.clear_all_plugin_highlights(plugin_id);
                 }
                 screen.render(None)?;
+            },
+            ScreenInstruction::DesktopNotificationResponse(raw_bytes, client_id) => {
+                if let Some((terminal_id, app_wants_report, is_query, rewritten_bytes)) =
+                    denormalize_notification_response(&raw_bytes)
+                {
+                    let pane_id = PaneId::Terminal(terminal_id);
+                    // Write response to the pane if the app expects it:
+                    // capability query answers (q flag) or activation reports (r flag)
+                    if app_wants_report || is_query {
+                        let all_tabs = screen.get_tabs_mut();
+                        for tab in all_tabs.values_mut() {
+                            if tab.has_pane_with_pid(&pane_id) {
+                                tab.write_to_pane_id(
+                                    &None,
+                                    rewritten_bytes,
+                                    false,
+                                    pane_id,
+                                    None,
+                                    None,
+                                )
+                                .non_fatal();
+                                break;
+                            }
+                        }
+                    }
+                    // Focus the pane on activation click (not on query responses)
+                    if !is_query {
+                        screen
+                            .focus_pane_with_id(pane_id, false, false, client_id)
+                            .non_fatal();
+                    }
+                    screen.render(None)?;
+                    screen.log_and_report_session_state()?;
+                }
             },
             ScreenInstruction::SubscribeToPaneRenders {
                 client_id,

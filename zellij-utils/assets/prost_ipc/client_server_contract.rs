@@ -808,6 +808,8 @@ pub struct EditFileAction {
     pub near_current_pane: bool,
     #[prost(bool, tag="8")]
     pub close_replaced_pane: bool,
+    #[prost(uint32, optional, tag="9")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -820,6 +822,8 @@ pub struct NewFloatingPaneAction {
     pub coordinates: ::core::option::Option<FloatingPaneCoordinates>,
     #[prost(bool, tag="7")]
     pub near_current_pane: bool,
+    #[prost(uint32, optional, tag="8")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -834,6 +838,8 @@ pub struct NewTiledPaneAction {
     pub near_current_pane: bool,
     #[prost(bool, optional, tag="8")]
     pub borderless: ::core::option::Option<bool>,
+    #[prost(uint32, optional, tag="9")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -848,6 +854,8 @@ pub struct NewInPlacePaneAction {
     pub pane_id_to_replace: ::core::option::Option<PaneId>,
     #[prost(bool, tag="5")]
     pub close_replaced_pane: bool,
+    #[prost(uint32, optional, tag="6")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -858,6 +866,8 @@ pub struct NewStackedPaneAction {
     pub pane_name: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(bool, tag="3")]
     pub near_current_pane: bool,
+    #[prost(uint32, optional, tag="4")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -872,6 +882,8 @@ pub struct NewBlockingPaneAction {
     pub unblock_condition: ::core::option::Option<i32>,
     #[prost(bool, tag="5")]
     pub near_current_pane: bool,
+    #[prost(uint32, optional, tag="6")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -950,6 +962,8 @@ pub struct LaunchOrFocusPluginAction {
     pub skip_cache: bool,
     #[prost(bool, tag="6")]
     pub close_replaced_pane: bool,
+    #[prost(uint32, optional, tag="7")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -966,6 +980,8 @@ pub struct LaunchPluginAction {
     pub cwd: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(bool, tag="6")]
     pub close_replaced_pane: bool,
+    #[prost(uint32, optional, tag="7")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1008,6 +1024,8 @@ pub struct NewTiledPluginPaneAction {
     pub skip_cache: bool,
     #[prost(string, optional, tag="4")]
     pub cwd: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint32, optional, tag="5")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1022,6 +1040,8 @@ pub struct NewFloatingPluginPaneAction {
     pub cwd: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(message, optional, tag="5")]
     pub coordinates: ::core::option::Option<FloatingPaneCoordinates>,
+    #[prost(uint32, optional, tag="6")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -1034,6 +1054,8 @@ pub struct NewInPlacePluginPaneAction {
     pub skip_cache: bool,
     #[prost(bool, tag="4")]
     pub close_replaced_pane: bool,
+    #[prost(uint32, optional, tag="5")]
+    pub tab_id: ::core::option::Option<u32>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
@@ -2835,7 +2857,7 @@ impl WebSharing {
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ClientToServerMsg {
-    #[prost(oneof="client_to_server_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17")]
+    #[prost(oneof="client_to_server_msg::Message", tags="1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18")]
     pub message: ::core::option::Option<client_to_server_msg::Message>,
 }
 /// Nested message and enum types in `ClientToServerMsg`.
@@ -2877,6 +2899,8 @@ pub mod client_to_server_msg {
         AttachWatcherClient(super::AttachWatcherClientMsg),
         #[prost(message, tag="17")]
         SubscribeToPaneRenders(super::SubscribeToPaneRendersMsg),
+        #[prost(message, tag="18")]
+        DesktopNotificationResponse(super::DesktopNotificationResponseMsg),
     }
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
@@ -3001,6 +3025,12 @@ pub struct SubscribeToPaneRendersMsg {
     pub scrollback: ::core::option::Option<u32>,
     #[prost(bool, tag="3")]
     pub ansi: bool,
+}
+#[allow(clippy::derive_partial_eq_without_eq)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DesktopNotificationResponseMsg {
+    #[prost(bytes="vec", tag="1")]
+    pub raw_bytes: ::prost::alloc::vec::Vec<u8>,
 }
 #[allow(clippy::derive_partial_eq_without_eq)]
 #[derive(Clone, PartialEq, ::prost::Message)]
